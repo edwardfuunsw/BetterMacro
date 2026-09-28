@@ -1,6 +1,18 @@
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Brings a document from any supported schema up to [`SCHEMA_VERSION`] in
+/// memory. The file itself is only rewritten when the macro is next saved.
+pub fn upgrade(mut document: MacroDocument) -> Option<MacroDocument> {
+    match document.schema_version {
+        // Version 2 only added image actions, so version 1 documents are already valid.
+        1 => document.schema_version = SCHEMA_VERSION,
+        SCHEMA_VERSION => {}
+        _ => return None,
+    }
+    Some(document)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +125,31 @@ pub enum Action {
         #[serde(alias = "delay_ms")]
         delay_ms: u64,
     },
+    /// Finds a screenshot snippet on the main display, then clicks it or just
+    /// waits for it to appear.
+    Image {
+        #[serde(default = "yes")]
+        enabled: bool,
+        /// Base64 PNG captured from the screen.
+        image: String,
+        /// Screen pixels per point when captured (2 on Retina), or 0 if unknown.
+        scale: f64,
+        /// When false the step only waits for the image to appear.
+        click: bool,
+        button: MouseButton,
+        clicks: u8,
+        /// Minimum match score, from 0 to 1.
+        similarity: f64,
+        timeout_ms: u64,
+        delay_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageCapture {
+    pub image: String,
+    pub scale: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,7 +253,8 @@ impl Action {
             | Self::Scroll { delay_ms, .. }
             | Self::Text { delay_ms, .. }
             | Self::Key { delay_ms, .. }
-            | Self::System { delay_ms, .. } => *delay_ms,
+            | Self::System { delay_ms, .. }
+            | Self::Image { delay_ms, .. } => *delay_ms,
             Self::Wait { duration_ms, .. } => *duration_ms,
         }
     }
@@ -230,7 +268,8 @@ impl Action {
             | Self::Text { enabled, .. }
             | Self::Key { enabled, .. }
             | Self::Wait { enabled, .. }
-            | Self::System { enabled, .. } => *enabled,
+            | Self::System { enabled, .. }
+            | Self::Image { enabled, .. } => *enabled,
         }
     }
 }
@@ -301,6 +340,33 @@ pub struct PlaybackProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_actions_round_trip() {
+        let json = r#"{"kind":"image","image":"iVBORw0KGgo=","scale":2,"click":true,"button":"left","clicks":2,"similarity":0.8,"timeoutMs":5000,"delayMs":100}"#;
+        let action: Action = serde_json::from_str(json).unwrap();
+        assert!(action.enabled());
+        assert_eq!(action.delay_ms(), 100);
+        let encoded = serde_json::to_string(&action).unwrap();
+        assert!(encoded.contains("\"timeoutMs\":5000"));
+    }
+
+    #[test]
+    fn version_1_documents_upgrade_and_unknown_versions_do_not() {
+        let document = |schema_version| MacroDocument {
+            schema_version,
+            id: "upgrade".into(),
+            name: "Upgrade".into(),
+            created_at: String::new(),
+            modified_at: String::new(),
+            favorite: false,
+            hotkey: None,
+            actions: Vec::new(),
+        };
+        assert_eq!(upgrade(document(1)).unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(upgrade(document(2)).unwrap().schema_version, SCHEMA_VERSION);
+        assert!(upgrade(document(99)).is_none());
+    }
 
     #[test]
     fn action_round_trips_through_json() {

@@ -1,14 +1,16 @@
 #![cfg(target_os = "macos")]
 
 use crate::model::{
-    Action, MouseButton, PlaybackProgress, PointerSample, RecordingSettings, RelativePoint,
-    ScreenPoint, ScrollUnit, SemanticNode, SemanticTarget, SystemCommand,
+    Action, ImageCapture, MouseButton, PlaybackProgress, PointerSample, RecordingSettings,
+    RelativePoint, ScreenPoint, ScrollUnit, SemanticNode, SemanticTarget, SystemCommand,
 };
+use crate::vision;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Serialize;
 use std::{
     collections::{HashSet, VecDeque},
     ffi::c_void,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -179,9 +181,16 @@ extern "C" {
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopAddSource(loop_ref: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopRun();
+    fn CGMainDisplayID() -> u32;
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
+    fn CGRectMakeWithDictionaryRepresentation(dict: *const c_void, rect: *mut CGRect) -> bool;
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFNumberGetValue(number: *const c_void, number_type: isize, value: *mut c_void) -> bool;
     static kCFRunLoopCommonModes: CFStringRef;
     static kAXTrustedCheckOptionPrompt: CFStringRef;
     static kCFBooleanTrue: *const c_void;
+    static kCGWindowOwnerPID: CFStringRef;
+    static kCGWindowBounds: CFStringRef;
 }
 
 #[link(name = "proc")]
@@ -223,6 +232,12 @@ const FIELD_EVENT_SOURCE_USER_DATA: u32 = 42;
 const SYNTHETIC_EVENT_MARKER: i64 = 0x424D_4143;
 // Points of real pointer travel that cancel playback, so a bumped desk does not.
 const MANUAL_POINTER_STOP_DISTANCE: f64 = 6.0;
+const WINDOW_LIST_ON_SCREEN_ONLY: u32 = 1;
+const CF_NUMBER_SINT32: isize = 3;
+const IMAGE_POLL_MS: u64 = 250;
+// Larger snippets make each search slow without making matches more reliable.
+const MAX_IMAGE_SIDE: usize = 800;
+const MIN_IMAGE_SIDE: usize = 8;
 const EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = u32::MAX - 1;
 const EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = u32::MAX;
 const SHIFT: u64 = 1 << 17;
@@ -1000,6 +1015,26 @@ impl MacAutomation {
                         target.as_ref(),
                         speed,
                     )?,
+                    Action::Image {
+                        image,
+                        scale,
+                        click,
+                        button,
+                        clicks,
+                        similarity,
+                        timeout_ms,
+                        delay_ms,
+                        ..
+                    } => self.play_image(
+                        image,
+                        *scale,
+                        click.then_some((*button, *clicks)),
+                        *similarity,
+                        *timeout_ms,
+                        *delay_ms,
+                        speed,
+                        pointer_hz,
+                    )?,
                     _ => {
                         if !self.wait_interruptibly(action.delay_ms(), speed) {
                             false
@@ -1413,6 +1448,87 @@ impl MacAutomation {
             return Ok(false);
         }
         Ok(self.wait_interruptibly(700, 1.0))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn play_image(
+        &self,
+        image: &str,
+        scale: f64,
+        click: Option<(MouseButton, u8)>,
+        similarity: f64,
+        timeout_ms: u64,
+        delay_ms: u64,
+        speed: f64,
+        pointer_hz: u16,
+    ) -> Result<bool, String> {
+        if !self.wait_interruptibly(delay_ms, speed) {
+            return Ok(false);
+        }
+        if !unsafe { CGPreflightScreenCaptureAccess() } {
+            return Err(
+                "Finding images needs Screen Recording permission. Open Permissions and grant Screen Recording."
+                    .into(),
+            );
+        }
+        let bytes = BASE64
+            .decode(image)
+            .map_err(|e| format!("This image step is damaged: {e}"))?;
+        let snippet = vision::decode_png(&bytes)?.image;
+        let started = Instant::now();
+        let mut closest = 0.0f32;
+        loop {
+            let (screen, bounds) = capture_main_display()?;
+            if !self.playing.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            let screen_scale = screen.width as f64 / bounds.size.width;
+            // A snippet captured on a display with a different scale is resized to match.
+            let resized;
+            let wanted = if scale > 0.0 && (scale - screen_scale).abs() > 0.01 {
+                let ratio = screen_scale / scale;
+                resized = snippet.resized(
+                    (snippet.width as f64 * ratio).round() as usize,
+                    (snippet.height as f64 * ratio).round() as usize,
+                );
+                &resized
+            } else {
+                &snippet
+            };
+            let excluded: Vec<vision::Rect> = unsafe { own_window_frames() }
+                .into_iter()
+                .map(|frame| vision::Rect {
+                    x: (frame.origin.x - bounds.origin.x) * screen_scale,
+                    y: (frame.origin.y - bounds.origin.y) * screen_scale,
+                    width: frame.size.width * screen_scale,
+                    height: frame.size.height * screen_scale,
+                })
+                .collect();
+            if let Some(found) = vision::find(&screen, wanted, &excluded) {
+                closest = closest.max(found.score);
+                if f64::from(found.score) >= similarity {
+                    let Some((button, clicks)) = click else {
+                        return Ok(true);
+                    };
+                    let x = bounds.origin.x
+                        + (found.x as f64 + wanted.width as f64 / 2.0) / screen_scale;
+                    let y = bounds.origin.y
+                        + (found.y as f64 + wanted.height as f64 / 2.0) / screen_scale;
+                    return self.play_click(x, y, button, clicks, 0, &[], None, speed, pointer_hz);
+                }
+            }
+            if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                return Err(format!(
+                    "Stopped because the image was not found within {:.1}s (closest match {:.0}%, needs {:.0}%).",
+                    timeout_ms as f64 / 1000.0,
+                    closest * 100.0,
+                    similarity * 100.0
+                ));
+            }
+            if !self.wait_interruptibly(IMAGE_POLL_MS, 1.0) {
+                return Ok(false);
+            }
+        }
     }
 
     fn wait_interruptibly(&self, millis: u64, speed: f64) -> bool {
@@ -2449,7 +2565,7 @@ unsafe fn post_action(action: &Action) -> Result<(), String> {
         Action::Move { x, y, .. } => {
             post_pointer_move(*x, *y)?;
         }
-        Action::Drag { .. } | Action::System { .. } => {}
+        Action::Drag { .. } | Action::System { .. } | Action::Image { .. } => {}
         Action::Scroll { x, y, unit, .. } => post_scroll(*x, *y, *unit)?,
         Action::Key {
             key_code,
@@ -2584,6 +2700,110 @@ unsafe fn post_pointer_event(
     post_synthetic(event);
     CFRelease(event);
     Ok(())
+}
+
+/// Screenshots are held in the per-user temporary folder and deleted straight after reading.
+fn temporary_png_path(purpose: &str) -> std::path::PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "bettermacro-{purpose}-{}-{}.png",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Screenshots the main display, returning the image and the display's bounds in points.
+fn capture_main_display() -> Result<(vision::Gray, CGRect), String> {
+    let path = temporary_png_path("screen");
+    let status = std::process::Command::new("/usr/sbin/screencapture")
+        .args(["-x", "-m", "-t", "png"])
+        .arg(&path)
+        .status()
+        .map_err(|e| format!("Unable to capture the screen: {e}"))?;
+    let bytes = std::fs::read(&path);
+    let _ = std::fs::remove_file(&path);
+    if !status.success() {
+        return Err("macOS refused the screen capture. Check Screen Recording in Permissions.".into());
+    }
+    let bytes = bytes.map_err(|e| format!("Unable to read the screen capture: {e}"))?;
+    let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    Ok((vision::decode_png(&bytes)?.image, bounds))
+}
+
+/// Frames of BetterMacro's own on-screen windows, so a search never matches the
+/// snippet previews shown inside the app.
+unsafe fn own_window_frames() -> Vec<CGRect> {
+    let windows = CGWindowListCopyWindowInfo(WINDOW_LIST_ON_SCREEN_ONLY, 0);
+    if windows.is_null() {
+        return Vec::new();
+    }
+    let pid = std::process::id() as i32;
+    let mut frames = Vec::new();
+    for index in 0..CFArrayGetCount(windows) {
+        let info = CFArrayGetValueAtIndex(windows, index);
+        let owner_value = CFDictionaryGetValue(info, kCGWindowOwnerPID);
+        let mut owner = 0i32;
+        if owner_value.is_null()
+            || !CFNumberGetValue(owner_value, CF_NUMBER_SINT32, (&mut owner as *mut i32).cast())
+            || owner != pid
+        {
+            continue;
+        }
+        let bounds = CFDictionaryGetValue(info, kCGWindowBounds);
+        let mut frame = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        };
+        if !bounds.is_null() && CGRectMakeWithDictionaryRepresentation(bounds, &mut frame) {
+            frames.push(frame);
+        }
+    }
+    CFRelease(windows);
+    frames
+}
+
+/// Lets the user drag out a region with the macOS screenshot crosshair.
+/// Returns `None` when they cancel with Escape.
+pub fn capture_image_target() -> Result<Option<ImageCapture>, String> {
+    if !unsafe { CGPreflightScreenCaptureAccess() } {
+        return Err(
+            "Capturing an image needs Screen Recording permission. Open Permissions and grant Screen Recording."
+                .into(),
+        );
+    }
+    let path = temporary_png_path("snippet");
+    std::process::Command::new("/usr/sbin/screencapture")
+        .args(["-i", "-s", "-x"])
+        .arg(&path)
+        .status()
+        .map_err(|e| format!("Unable to start the screen capture: {e}"))?;
+    let bytes = std::fs::read(&path);
+    let _ = std::fs::remove_file(&path);
+    // screencapture writes no file when the selection is cancelled.
+    let Ok(bytes) = bytes else {
+        return Ok(None);
+    };
+    let decoded = vision::decode_png(&bytes)?;
+    let (width, height) = (decoded.image.width, decoded.image.height);
+    if width < MIN_IMAGE_SIDE || height < MIN_IMAGE_SIDE {
+        return Err("That selection is too small to find reliably. Drag out a slightly larger area.".into());
+    }
+    if width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE {
+        return Err("That selection is too large. Select just the button or icon to find.".into());
+    }
+    if !vision::has_detail(&decoded.image) {
+        return Err(
+            "That area is almost a single colour, so it can't be found reliably. Include some text or an edge."
+                .into(),
+        );
+    }
+    Ok(Some(ImageCapture {
+        image: BASE64.encode(&bytes),
+        scale: decoded.scale.unwrap_or(0.0),
+    }))
 }
 
 unsafe fn current_pointer_location() -> Result<CGPoint, String> {

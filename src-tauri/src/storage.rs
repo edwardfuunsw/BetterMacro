@@ -1,4 +1,4 @@
-use crate::model::{MacroDocument, SCHEMA_VERSION};
+use crate::model::{upgrade, MacroDocument, SCHEMA_VERSION};
 use std::{
     fs,
     path::PathBuf,
@@ -75,13 +75,12 @@ pub fn load_all() -> Result<(Vec<MacroDocument>, Vec<String>), String> {
                 continue;
             }
         };
-        if document.schema_version == SCHEMA_VERSION {
-            documents.push(document);
-        } else {
-            warnings.push(format!(
-                "{file_name} uses unsupported schema version {}.",
-                document.schema_version
-            ));
+        let version = document.schema_version;
+        match upgrade(document) {
+            Some(document) => documents.push(document),
+            None => warnings.push(format!(
+                "{file_name} uses unsupported schema version {version}."
+            )),
         }
     }
     documents.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
@@ -109,13 +108,12 @@ pub fn import(path: PathBuf) -> Result<MacroDocument, String> {
     let raw = fs::read(path).map_err(|e| format!("Unable to read macro: {e}"))?;
     let document: MacroDocument =
         serde_json::from_slice(&raw).map_err(|e| format!("Invalid BetterMacro file: {e}"))?;
-    if document.schema_version != SCHEMA_VERSION {
-        return Err(format!(
-            "This macro uses schema version {}; BetterMacro currently supports version {SCHEMA_VERSION}.",
-            document.schema_version
-        ));
-    }
-    Ok(document)
+    let version = document.schema_version;
+    upgrade(document).ok_or_else(|| {
+        format!(
+            "This macro uses schema version {version}; BetterMacro supports versions 1 to {SCHEMA_VERSION}."
+        )
+    })
 }
 
 #[cfg(test)]

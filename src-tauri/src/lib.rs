@@ -1,6 +1,7 @@
 mod macos;
 mod model;
 mod storage;
+mod vision;
 
 use std::path::PathBuf;
 use std::sync::{
@@ -9,7 +10,7 @@ use std::sync::{
 };
 
 use macos::{MacAutomation, PermissionState};
-use model::{Action, MacroDocument, PlaybackProgress, RecordingSettings};
+use model::{Action, ImageCapture, MacroDocument, PlaybackProgress, RecordingSettings};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -192,6 +193,29 @@ fn import_macro(path: PathBuf) -> Result<MacroDocument, String> {
     storage::import(path)
 }
 
+#[tauri::command]
+async fn capture_image(app: AppHandle) -> Result<Option<ImageCapture>, String> {
+    // Hide BetterMacro so it does not cover what the user wants to select.
+    let window = app.get_webview_window("main");
+    if let Some(window) = &window {
+        let _ = window.hide();
+    }
+    let result = match tauri::async_runtime::spawn_blocking(|| {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        macos::capture_image_target()
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("Image capture failed: {error}")),
+    };
+    if let Some(window) = &window {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    result
+}
+
 pub fn run() {
     let automation = Arc::new(MacAutomation::new());
 
@@ -238,7 +262,8 @@ pub fn run() {
             load_macros,
             delete_macro,
             export_macro,
-            import_macro
+            import_macro,
+            capture_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running BetterMacro");
