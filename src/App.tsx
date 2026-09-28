@@ -69,7 +69,9 @@ export function App() {
   const [recording, setRecording] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [playIndex, setPlayIndex] = useState<number | null>(null);
+  const [playLoop, setPlayLoop] = useState(1);
   const [speed, setSpeed] = useState(1);
+  const [repeat, setRepeat] = useState(1); // 0 repeats until stopped
   const [appSettings, setAppSettings] = useState<AppSettings>(() => {
     try {
       return normalizeAppSettings(JSON.parse(localStorage.getItem("bettermacro.settings") ?? "{}"));
@@ -127,8 +129,8 @@ export function App() {
     const cleanups = Promise.all([
       listen<Action[]>("recording-actions", event => commit(current => ({ ...current, actions: event.payload, modifiedAt: now() }))),
       listen<boolean>("recording-state", event => setRecording(event.payload)),
-      listen<boolean>("playback-state", event => { setPlaying(event.payload); if (!event.payload) setPlayIndex(null); }),
-      listen<{ index: number }>("playback-progress", event => setPlayIndex(event.payload.index)),
+      listen<boolean>("playback-state", event => { setPlaying(event.payload); if (!event.payload) { setPlayIndex(null); setPlayLoop(1); } }),
+      listen<{ index: number; iteration: number }>("playback-progress", event => { setPlayIndex(event.payload.index); setPlayLoop(event.payload.iteration); }),
       listen<string>("playback-error", event => setNotice(event.payload)),
     ]);
     return () => { void cleanups.then(items => items.forEach(unlisten => unlisten())); };
@@ -149,7 +151,7 @@ export function App() {
   const duplicateSelected = () => { if (selected === null) return; insertAction(cloneAction(active.actions[selected])); };
   const save = useCallback(async () => { try { const source = active; const document = { ...source, name: source.name.trim() || "Untitled macro", modifiedAt: now() }; await invoke("save_macro", { document }); setMacros(items => [document, ...items.filter(item => item.id !== document.id)]); if (activeRef.current === source) { userChangedActive.current = false; setActive(document); setSaveState("Saved just now"); } } catch (error) { setNotice(errorMessage(error)); } }, [active]);
   const toggleRecording = useCallback(async () => { try { setNotice(null); if (recording) { await invoke("stop_recording"); return; } if (!permissions?.inputMonitoring || !permissions.accessibility) { setPermissionOpen(true); return; } setSelected(null); await invoke("start_recording", { settings: appSettings.recording }); } catch (error) { setNotice(errorMessage(error)); } }, [appSettings.recording, permissions?.accessibility, permissions?.inputMonitoring, recording]);
-  const play = useCallback(async (from = 0) => { if (!active.actions.length || playing || recording) return; if (!permissions?.accessibility || !permissions.eventPosting) { setPermissionOpen(true); return; } try { setNotice(null); await invoke("playback", { actions: active.actions, startAt: from, speed, pointerHz: appSettings.pointerHz }); } catch (error) { setNotice(errorMessage(error)); } }, [active.actions, appSettings.pointerHz, permissions, playing, recording, speed]);
+  const play = useCallback(async (from = 0) => { if (!active.actions.length || playing || recording) return; if (!permissions?.accessibility || !permissions.eventPosting) { setPermissionOpen(true); return; } try { setNotice(null); await invoke("playback", { actions: active.actions, startAt: from, repeat, speed, pointerHz: appSettings.pointerHz }); } catch (error) { setNotice(errorMessage(error)); } }, [active.actions, appSettings.pointerHz, permissions, playing, recording, repeat, speed]);
   const stop = async () => { try { await invoke(recording ? "stop_recording" : "stop_playback"); } catch (error) { setNotice(errorMessage(error)); } };
   const activateMacro = (macro: MacroDocument, status = "Saved locally") => { userChangedActive.current = true; setActive(macro); setSelected(null); undoStack.current = []; redoStack.current = []; setSaveState(status); };
   const canDiscardChanges = useCallback(() => saveState !== "Unsaved changes" || confirm("Discard the unsaved changes to this macro?"), [saveState]);
@@ -206,6 +208,7 @@ export function App() {
         <span className="toolbar-divider"/>
         <button className="tool-button" disabled={recording || playing || !active.actions.length} onClick={() => void play()}><Play size={16} fill="currentColor"/> Play</button>
         <label className="speed"><span>Speed</span><select value={speed} onChange={event => setSpeed(Number(event.target.value))}>{[0.25,0.5,1,1.5,2,5].map(option => <option key={option} value={option}>{option}×</option>)}</select></label>
+        <label className="speed" title="How many times to play the macro. ∞ repeats until you stop it."><span>Repeat</span><select value={repeat} disabled={playing} onChange={event => setRepeat(Number(event.target.value))}>{[1,2,3,5,10,25,50,100,0].map(option => <option key={option} value={option}>{option === 0 ? "∞" : `${option}×`}</option>)}</select></label>
         <span className="toolbar-spacer"/>
         <button className="tool-button" onClick={() => void save()}><Save size={15}/> Save <kbd>⌘S</kbd></button>
       </div>
@@ -231,7 +234,7 @@ export function App() {
         {active.actions.length === 0 ? <EmptyState recording={recording} onRecord={() => void toggleRecording()} onCreate={() => insertAction({ kind: "wait", durationMs: 1000 })}/> : visibleActions.map(({ action, index }) => <ActionRow key={index} action={action} index={index} selected={selected === index} executing={playIndex === index} onSelect={() => setSelected(index)} onToggle={() => updateAction(index, { ...action, enabled: action.enabled === false })} onReorder={reorderAction}/>) }
         {active.actions.length > 0 && visibleActions.length === 0 && <div className="no-results">No actions match “{search}”.</div>}
       </div>
-      <footer className="statusbar"><span className={recording ? "status-recording" : ""}><i/>{recording ? "Recording globally" : playing ? `Running action ${(playIndex ?? 0) + 1} / ${active.actions.length}` : saveState}</span><span>{recording ? "Press Stop when finished" : playing ? runtimeStatus?.emergencyStopAvailable === false ? "Use Stop to end playback" : "Press ⌃⌥Esc to stop immediately" : runtimeStatus?.emergencyStopAvailable === false ? "Emergency shortcut unavailable · Stop still works" : `${appSettings.pointerHz} pointer events/sec`}</span></footer>
+      <footer className="statusbar"><span className={recording ? "status-recording" : ""}><i/>{recording ? "Recording globally" : playing ? `Running action ${(playIndex ?? 0) + 1} / ${active.actions.length}${repeat === 1 ? "" : ` · loop ${playLoop}${repeat ? ` of ${repeat}` : ""}`}` : saveState}</span><span>{recording ? "Press Stop when finished" : playing ? runtimeStatus?.emergencyStopAvailable === false ? "Use Stop or move the mouse to end playback" : "Press ⌃⌥Esc or move the mouse to stop" : runtimeStatus?.emergencyStopAvailable === false ? "Emergency shortcut unavailable · Stop still works" : `${appSettings.pointerHz} pointer events/sec`}</span></footer>
     </section>
 
     <aside className="inspector">

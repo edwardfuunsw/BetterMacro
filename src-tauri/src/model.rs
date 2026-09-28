@@ -295,6 +295,7 @@ impl Default for RecordingSettings {
 pub struct PlaybackProgress {
     pub index: usize,
     pub total: usize,
+    pub iteration: u32,
 }
 
 #[cfg(test)]

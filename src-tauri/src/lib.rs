@@ -86,6 +86,7 @@ fn playback(
     state: State<'_, AppState>,
     actions: Vec<Action>,
     start_at: Option<usize>,
+    repeat: Option<u32>,
     speed: f64,
     pointer_hz: Option<u16>,
 ) -> Result<(), String> {
@@ -99,6 +100,11 @@ fn playback(
     if !speed.is_finite() || speed <= 0.0 {
         return Err("Playback speed must be a positive number.".into());
     }
+    // The listener is what notices the real mouse moving and cancels playback.
+    state.automation.ensure_event_listener().map_err(|_| {
+        "BetterMacro can't watch for mouse movement, so playback was not started. Check Input Monitoring in Permissions."
+            .to_string()
+    })?;
     state.automation.begin_playback()?;
     let automation = Arc::clone(&state.automation);
     let playback_app = app.clone();
@@ -107,6 +113,7 @@ fn playback(
         let result = automation.play(
             &actions,
             start,
+            repeat.unwrap_or(1),
             speed,
             pointer_hz.unwrap_or(120),
             |progress: PlaybackProgress| {
@@ -115,6 +122,11 @@ fn playback(
         );
         if let Err(error) = result {
             let _ = playback_app.emit("playback-error", error);
+        } else if automation.take_stopped_by_pointer() {
+            let _ = playback_app.emit(
+                "playback-error",
+                "Playback stopped because the mouse moved.",
+            );
         }
         automation.complete_playback();
         let _ = playback_app.emit("playback-state", false);

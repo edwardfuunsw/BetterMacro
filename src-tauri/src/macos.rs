@@ -215,6 +215,14 @@ const FIELD_SCROLL_POINT_DELTA_Y: u32 = 96;
 const FIELD_SCROLL_POINT_DELTA_X: u32 = 97;
 const FIELD_SCROLL_FIXED_DELTA_Y: u32 = 93;
 const FIELD_SCROLL_FIXED_DELTA_X: u32 = 94;
+const FIELD_MOUSE_DELTA_X: u32 = 4;
+const FIELD_MOUSE_DELTA_Y: u32 = 5;
+const FIELD_EVENT_SOURCE_USER_DATA: u32 = 42;
+// Stamped on every event BetterMacro posts so the listener can tell playback
+// apart from someone moving the real mouse.
+const SYNTHETIC_EVENT_MARKER: i64 = 0x424D_4143;
+// Points of real pointer travel that cancel playback, so a bumped desk does not.
+const MANUAL_POINTER_STOP_DISTANCE: f64 = 6.0;
 const EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = u32::MAX - 1;
 const EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = u32::MAX;
 const SHIFT: u64 = 1 << 17;
@@ -300,6 +308,8 @@ pub struct MacAutomation {
     mode: Mutex<AutomationMode>,
     playing: AtomicBool,
     listener_started: AtomicBool,
+    stopped_by_pointer: AtomicBool,
+    manual_pointer_travel: Mutex<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +326,8 @@ impl MacAutomation {
             mode: Mutex::new(AutomationMode::Idle),
             playing: AtomicBool::new(false),
             listener_started: AtomicBool::new(false),
+            stopped_by_pointer: AtomicBool::new(false),
+            manual_pointer_travel: Mutex::new(0.0),
         }
     }
     pub fn permission_status(&self) -> PermissionState {
@@ -428,8 +440,39 @@ impl MacAutomation {
             return Err("Stop the current recording or playback before starting playback.".into());
         }
         *mode = AutomationMode::Playing;
+        self.stopped_by_pointer.store(false, Ordering::SeqCst);
+        if let Ok(mut travel) = self.manual_pointer_travel.lock() {
+            *travel = 0.0;
+        }
         self.playing.store(true, Ordering::SeqCst);
         Ok(())
+    }
+    pub fn take_stopped_by_pointer(&self) -> bool {
+        self.stopped_by_pointer.swap(false, Ordering::SeqCst)
+    }
+
+    fn stop_on_manual_pointer(&self, event_type: u32, event: CGEventRef) {
+        if !matches!(
+            event_type,
+            MOUSE_MOVED | LEFT_DRAGGED | RIGHT_DRAGGED | OTHER_DRAGGED
+        ) || !self.playing.load(Ordering::SeqCst)
+            || unsafe { CGEventGetIntegerValueField(event, FIELD_EVENT_SOURCE_USER_DATA) }
+                == SYNTHETIC_EVENT_MARKER
+        {
+            return;
+        }
+        let distance = unsafe {
+            CGEventGetDoubleValueField(event, FIELD_MOUSE_DELTA_X)
+                .hypot(CGEventGetDoubleValueField(event, FIELD_MOUSE_DELTA_Y))
+        };
+        let Ok(mut travel) = self.manual_pointer_travel.lock() else {
+            return;
+        };
+        *travel += distance;
+        if *travel >= MANUAL_POINTER_STOP_DISTANCE {
+            self.stopped_by_pointer.store(true, Ordering::SeqCst);
+            self.playing.store(false, Ordering::SeqCst);
+        }
     }
     pub fn complete_playback(&self) {
         self.playing.store(false, Ordering::SeqCst);
@@ -787,10 +830,12 @@ impl MacAutomation {
         }
     }
 
+    /// Plays the macro `repeat` times, or until stopped when `repeat` is 0.
     pub fn play<F: FnMut(PlaybackProgress)>(
         &self,
         actions: &[Action],
         start_at: usize,
+        repeat: u32,
         speed: f64,
         pointer_hz: u16,
         mut progress: F,
@@ -805,18 +850,50 @@ impl MacAutomation {
                     .into(),
             );
         }
+        if repeat != 1 && !actions.iter().any(Action::enabled) {
+            return Err("Enable at least one action before repeating this macro.".into());
+        }
         let speed = speed.clamp(0.25, 5.0);
         let pointer_hz = pointer_hz.clamp(30, 240);
+        let mut iteration = 1;
+        // Only the first pass honours "play from here"; repeats start at the top.
+        while self.play_pass(
+            actions,
+            if iteration == 1 { start_at } else { 0 },
+            iteration,
+            speed,
+            pointer_hz,
+            &mut progress,
+        )? {
+            if repeat != 0 && iteration >= repeat {
+                break;
+            }
+            iteration = iteration.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Returns whether the pass reached the end of the macro without being stopped.
+    fn play_pass<F: FnMut(PlaybackProgress)>(
+        &self,
+        actions: &[Action],
+        start_at: usize,
+        iteration: u32,
+        speed: f64,
+        pointer_hz: u16,
+        progress: &mut F,
+    ) -> Result<bool, String> {
         let mut pressed_keys = HashSet::new();
         let result = (|| {
             for (offset, action) in actions.iter().skip(start_at).enumerate() {
                 if !self.playing.load(Ordering::SeqCst) {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if !action.enabled() {
                     progress(PlaybackProgress {
                         index: start_at + offset,
                         total: actions.len(),
+                        iteration,
                     });
                     continue;
                 }
@@ -854,7 +931,7 @@ impl MacAutomation {
                             *delay_ms
                         } else {
                             if !self.wait_interruptibly(*delay_ms, speed) {
-                                return Ok(());
+                                return Ok(false);
                             }
                             *duration_ms
                         };
@@ -942,17 +1019,18 @@ impl MacAutomation {
                     }
                 }
                 if !completed || !self.playing.load(Ordering::SeqCst) {
-                    return Ok(());
+                    return Ok(false);
                 }
                 progress(PlaybackProgress {
                     index: start_at + offset,
                     total: actions.len(),
+                    iteration,
                 });
             }
-            Ok(())
+            Ok(true)
         })();
         let release_result = unsafe { release_pressed_keys(&pressed_keys) };
-        result.and(release_result)
+        result.and_then(|finished| release_result.map(|()| finished))
     }
 
     fn play_text(&self, text: &str, target: Option<&SemanticTarget>) -> Result<bool, String> {
@@ -2353,6 +2431,7 @@ extern "C" fn event_callback(
     LISTENER.with(|slot| {
         if let Some(listener) = slot.borrow().as_ref() {
             listener.record_event(event_type, event);
+            listener.stop_on_manual_pointer(event_type, event);
         }
     });
     event
@@ -2383,7 +2462,7 @@ unsafe fn post_action(action: &Action) -> Result<(), String> {
                 return Err("Unable to create keyboard event".into());
             }
             CGEventSetFlags(event, *modifiers);
-            CGEventPost(HID_TAP, event);
+            post_synthetic(event);
             CFRelease(event);
         }
         Action::Text { text, .. } => {
@@ -2394,6 +2473,11 @@ unsafe fn post_action(action: &Action) -> Result<(), String> {
         Action::Wait { .. } => {}
     };
     Ok(())
+}
+
+unsafe fn post_synthetic(event: CGEventRef) {
+    CGEventSetIntegerValueField(event, FIELD_EVENT_SOURCE_USER_DATA, SYNTHETIC_EVENT_MARKER);
+    CGEventPost(HID_TAP, event);
 }
 
 unsafe fn post_click(point: CGPoint, button: MouseButton, clicks: u8) -> Result<(), String> {
@@ -2416,10 +2500,10 @@ unsafe fn post_click(point: CGPoint, button: MouseButton, clicks: u8) -> Result<
         }
         CGEventSetIntegerValueField(press, FIELD_MOUSE_CLICK_STATE, click_state);
         CGEventSetIntegerValueField(release, FIELD_MOUSE_CLICK_STATE, click_state);
-        CGEventPost(HID_TAP, press);
+        post_synthetic(press);
         CFRelease(press);
         std::thread::sleep(Duration::from_millis(12));
-        CGEventPost(HID_TAP, release);
+        post_synthetic(release);
         CFRelease(release);
         if click_index + 1 < click_count {
             std::thread::sleep(Duration::from_millis(70));
@@ -2443,7 +2527,7 @@ unsafe fn post_scroll(x: i32, y: i32, unit: ScrollUnit) -> Result<(), String> {
     if event.is_null() {
         return Err("Unable to create scroll event".into());
     }
-    CGEventPost(HID_TAP, event);
+    post_synthetic(event);
     CFRelease(event);
     Ok(())
 }
@@ -2468,8 +2552,8 @@ unsafe fn post_unicode_character(character: char) -> Result<(), String> {
     }
     CGEventKeyboardSetUnicodeString(down, encoded.len(), encoded.as_ptr());
     CGEventKeyboardSetUnicodeString(up, encoded.len(), encoded.as_ptr());
-    CGEventPost(HID_TAP, down);
-    CGEventPost(HID_TAP, up);
+    post_synthetic(down);
+    post_synthetic(up);
     CFRelease(down);
     CFRelease(up);
     Ok(())
@@ -2482,7 +2566,7 @@ unsafe fn release_pressed_keys(keys: &HashSet<u16>) -> Result<(), String> {
             return Err("Unable to release a keyboard key after playback".into());
         }
         CGEventSetFlags(event, 0);
-        CGEventPost(HID_TAP, event);
+        post_synthetic(event);
         CFRelease(event);
     }
     Ok(())
@@ -2497,7 +2581,7 @@ unsafe fn post_pointer_event(
     if event.is_null() {
         return Err("Unable to create mouse event".into());
     }
-    CGEventPost(HID_TAP, event);
+    post_synthetic(event);
     CFRelease(event);
     Ok(())
 }
@@ -2545,7 +2629,7 @@ unsafe fn post_key_event(keycode: u16, down: bool, modifiers: u64) -> Result<(),
         return Err("Unable to create system shortcut".into());
     }
     CGEventSetFlags(event, modifiers);
-    CGEventPost(HID_TAP, event);
+    post_synthetic(event);
     CFRelease(event);
     Ok(())
 }
@@ -2865,5 +2949,32 @@ mod tests {
             "/Applications/Browser.app/Contents/MacOS/Browser",
             "/Applications/Other.app/Contents/MacOS/Browser"
         ));
+    }
+
+    #[test]
+    fn only_real_pointer_movement_stops_playback() {
+        let automation = MacAutomation::new();
+        automation.begin_playback().unwrap();
+        // macOS ignores resetting the user-data field to 0, so each case needs its own event.
+        let moved_by = |marker: Option<i64>| unsafe {
+            let event = CGEventCreateMouseEvent(
+                std::ptr::null_mut(),
+                MOUSE_MOVED,
+                CGPoint { x: 10.0, y: 10.0 },
+                0,
+            );
+            assert!(!event.is_null());
+            CGEventSetIntegerValueField(event, FIELD_MOUSE_DELTA_X, 20);
+            if let Some(marker) = marker {
+                CGEventSetIntegerValueField(event, FIELD_EVENT_SOURCE_USER_DATA, marker);
+            }
+            automation.stop_on_manual_pointer(MOUSE_MOVED, event);
+            CFRelease(event);
+        };
+        moved_by(Some(SYNTHETIC_EVENT_MARKER));
+        assert!(automation.playing.load(Ordering::SeqCst));
+        moved_by(None);
+        assert!(!automation.playing.load(Ordering::SeqCst));
+        assert!(automation.take_stopped_by_pointer());
     }
 }
