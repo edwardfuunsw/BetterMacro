@@ -39,11 +39,11 @@ export type Action = { enabled?: boolean } & (
   | { kind: "key"; keyCode: number; modifiers: number; down: boolean; delayMs: number }
   | { kind: "wait"; durationMs: number }
   | { kind: "system"; command: SystemCommand; delayMs: number }
-  | { kind: "image"; image: string; scale: number; click: boolean; button: MouseButton; clicks: number; similarity: number; timeoutMs: number; delayMs: number }
+  | { kind: "image"; image: string; scale: number; click: boolean; button: MouseButton; clicks: number; similarity: number; timeoutMs: number; delayMs: number; at?: ScreenPoint | null; offset?: RelativePoint | null }
 );
 
 /** A base64 PNG snippet picked with the macOS screenshot crosshair. */
-export type ImageCapture = { image: string; scale: number };
+export type ImageCapture = { image: string; scale: number; at: ScreenPoint | null };
 
 export type MacroDocument = { schemaVersion: number; id: string; name: string; createdAt: string; modifiedAt: string; favorite: boolean; hotkey?: string | null; actions: Action[] };
 export type PermissionState = { accessibility: boolean; eventPosting: boolean; inputMonitoring: boolean; screenRecording: boolean; inputMonitoringNote: string };

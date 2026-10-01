@@ -142,6 +142,13 @@ pub enum Action {
         similarity: f64,
         timeout_ms: u64,
         delay_ms: u64,
+        /// Where the image's centre was when captured, in screen points. Searched
+        /// first, and decides between several equally good matches.
+        #[serde(default)]
+        at: Option<ScreenPoint>,
+        /// Where inside the image to click, from 0 to 1. The centre when unset.
+        #[serde(default)]
+        offset: Option<RelativePoint>,
     },
 }
 
@@ -150,6 +157,7 @@ pub enum Action {
 pub struct ImageCapture {
     pub image: String,
     pub scale: f64,
+    pub at: Option<ScreenPoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

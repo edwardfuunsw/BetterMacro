@@ -1024,6 +1024,8 @@ impl MacAutomation {
                         similarity,
                         timeout_ms,
                         delay_ms,
+                        at,
+                        offset,
                         ..
                     } => self.play_image(
                         image,
@@ -1032,6 +1034,8 @@ impl MacAutomation {
                         *similarity,
                         *timeout_ms,
                         *delay_ms,
+                        at.as_ref(),
+                        offset.as_ref(),
                         speed,
                         pointer_hz,
                     )?,
@@ -1459,6 +1463,8 @@ impl MacAutomation {
         similarity: f64,
         timeout_ms: u64,
         delay_ms: u64,
+        at: Option<&ScreenPoint>,
+        offset: Option<&RelativePoint>,
         speed: f64,
         pointer_hz: u16,
     ) -> Result<bool, String> {
@@ -1474,11 +1480,15 @@ impl MacAutomation {
         let bytes = BASE64
             .decode(image)
             .map_err(|e| format!("This image step is damaged: {e}"))?;
-        let snippet = vision::decode_png(&bytes)?.image;
+        let decoded = vision::decode_png(&bytes)?;
+        let snippet = decoded.image;
+        let snippet_chroma = decoded.colour.chroma(0, 0, snippet.width, snippet.height);
         let started = Instant::now();
         let mut closest = 0.0f32;
+        let mut wrong_colour = false;
         loop {
-            let (screen, bounds) = capture_main_display()?;
+            let (capture, bounds) = capture_main_display()?;
+            let screen = &capture.image;
             if !self.playing.load(Ordering::SeqCst) {
                 return Ok(false);
             }
@@ -1504,22 +1514,71 @@ impl MacAutomation {
                     height: frame.size.height * screen_scale,
                 })
                 .collect();
-            if let Some(found) = vision::find(&screen, wanted, &excluded) {
-                closest = closest.max(found.score);
-                if f64::from(found.score) >= similarity {
-                    let Some((button, clicks)) = click else {
-                        return Ok(true);
-                    };
-                    let x = bounds.origin.x
-                        + (found.x as f64 + wanted.width as f64 / 2.0) / screen_scale;
-                    let y = bounds.origin.y
-                        + (found.y as f64 + wanted.height as f64 / 2.0) / screen_scale;
-                    return self.play_click(x, y, button, clicks, 0, &[], None, speed, pointer_hz);
+            // Luminance alone cannot tell a green Buy button from a red Sell
+            // button of the same shape, so every match must also share its colour.
+            let accepted = |found: &vision::Match| {
+                let chroma = capture
+                    .colour
+                    .chroma(found.x, found.y, wanted.width, wanted.height);
+                f64::from(found.score) >= similarity && vision::same_colour(snippet_chroma, chroma)
+            };
+            let expected = at.map(|point| {
+                (
+                    (point.x - bounds.origin.x) * screen_scale,
+                    (point.y - bounds.origin.y) * screen_scale,
+                )
+            });
+            // Looking where the image was captured first is quicker, and stops a
+            // repeated button being confused with another copy of it.
+            let nearby = expected.and_then(|(x, y)| {
+                let margin = wanted.width.max(wanted.height) as f64;
+                let area = vision::Rect {
+                    x: x - wanted.width as f64 / 2.0 - margin,
+                    y: y - wanted.height as f64 / 2.0 - margin,
+                    width: wanted.width as f64 + 2.0 * margin,
+                    height: wanted.height as f64 + 2.0 * margin,
+                };
+                vision::find_in(screen, wanted, &excluded, area)
+                    .into_iter()
+                    .find(|found| accepted(found))
+            });
+            let found = nearby.or_else(|| {
+                let matches = vision::find(screen, wanted, &excluded);
+                for found in &matches {
+                    closest = closest.max(found.score);
+                    wrong_colour |= f64::from(found.score) >= similarity && !accepted(found);
                 }
+                let distance = |found: &vision::Match| {
+                    expected.map_or(0.0, |(x, y)| {
+                        (found.x as f64 + wanted.width as f64 / 2.0 - x)
+                            .hypot(found.y as f64 + wanted.height as f64 / 2.0 - y)
+                    })
+                };
+                // Best first, so without a capture position the strongest match wins.
+                matches
+                    .into_iter()
+                    .filter(|found| accepted(found))
+                    .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+            });
+            if let Some(found) = found {
+                let Some((button, clicks)) = click else {
+                    return Ok(true);
+                };
+                let (fx, fy) = offset.map_or((0.5, 0.5), |offset| {
+                    (offset.x.clamp(0.0, 1.0), offset.y.clamp(0.0, 1.0))
+                });
+                let x = bounds.origin.x + (found.x as f64 + wanted.width as f64 * fx) / screen_scale;
+                let y = bounds.origin.y + (found.y as f64 + wanted.height as f64 * fy) / screen_scale;
+                return self.play_click(x, y, button, clicks, 0, &[], None, speed, pointer_hz);
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                let colour_note = if wrong_colour {
+                    " Something with the same shape but a different colour was on screen, so it was not clicked."
+                } else {
+                    ""
+                };
                 return Err(format!(
-                    "Stopped because the image was not found within {:.1}s (closest match {:.0}%, needs {:.0}%).",
+                    "Stopped because the image was not found within {:.1}s (closest match {:.0}%, needs {:.0}%).{colour_note}",
                     timeout_ms as f64 / 1000.0,
                     closest * 100.0,
                     similarity * 100.0
@@ -2713,7 +2772,7 @@ fn temporary_png_path(purpose: &str) -> std::path::PathBuf {
 }
 
 /// Screenshots the main display, returning the image and the display's bounds in points.
-fn capture_main_display() -> Result<(vision::Gray, CGRect), String> {
+fn capture_main_display() -> Result<(vision::DecodedPng, CGRect), String> {
     let path = temporary_png_path("screen");
     let status = std::process::Command::new("/usr/sbin/screencapture")
         .args(["-x", "-m", "-t", "png"])
@@ -2727,7 +2786,7 @@ fn capture_main_display() -> Result<(vision::Gray, CGRect), String> {
     }
     let bytes = bytes.map_err(|e| format!("Unable to read the screen capture: {e}"))?;
     let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
-    Ok((vision::decode_png(&bytes)?.image, bounds))
+    Ok((vision::decode_png(&bytes)?, bounds))
 }
 
 /// Frames of BetterMacro's own on-screen windows, so a search never matches the
@@ -2765,6 +2824,11 @@ unsafe fn own_window_frames() -> Vec<CGRect> {
     frames
 }
 
+pub fn pointer_location() -> Result<ScreenPoint, String> {
+    let point = unsafe { current_pointer_location()? };
+    Ok(ScreenPoint { x: point.x, y: point.y })
+}
+
 /// Lets the user drag out a region with the macOS screenshot crosshair.
 /// Returns `None` when they cancel with Escape.
 pub fn capture_image_target() -> Result<Option<ImageCapture>, String> {
@@ -2780,6 +2844,7 @@ pub fn capture_image_target() -> Result<Option<ImageCapture>, String> {
         .arg(&path)
         .status()
         .map_err(|e| format!("Unable to start the screen capture: {e}"))?;
+    let pointer = pointer_location().ok();
     let bytes = std::fs::read(&path);
     let _ = std::fs::remove_file(&path);
     // screencapture writes no file when the selection is cancelled.
@@ -2803,7 +2868,37 @@ pub fn capture_image_target() -> Result<Option<ImageCapture>, String> {
     Ok(Some(ImageCapture {
         image: BASE64.encode(&bytes),
         scale: decoded.scale.unwrap_or(0.0),
+        at: locate_selection(&decoded.image, pointer.as_ref()),
     }))
+}
+
+/// Finds where a just-captured snippet sits on the main display; BetterMacro is
+/// still hidden, so it is on screen. The pointer rests at a corner of the
+/// selection, which decides between identical copies.
+fn locate_selection(snippet: &vision::Gray, pointer: Option<&ScreenPoint>) -> Option<ScreenPoint> {
+    let (capture, bounds) = capture_main_display().ok()?;
+    let scale = capture.image.width as f64 / bounds.size.width;
+    let (half_width, half_height) = (
+        snippet.width as f64 / scale / 2.0,
+        snippet.height as f64 / scale / 2.0,
+    );
+    let centre = |found: &vision::Match| ScreenPoint {
+        x: bounds.origin.x + found.x as f64 / scale + half_width,
+        y: bounds.origin.y + found.y as f64 / scale + half_height,
+    };
+    let distance_to_pointer = |found: &vision::Match| {
+        pointer.map_or(0.0, |pointer| {
+            let centre = centre(found);
+            let dx = ((pointer.x - centre.x).abs() - half_width).max(0.0);
+            let dy = ((pointer.y - centre.y).abs() - half_height).max(0.0);
+            dx.hypot(dy)
+        })
+    };
+    vision::find(&capture.image, snippet, &[])
+        .into_iter()
+        .filter(|found| found.score >= 0.95)
+        .min_by(|a, b| distance_to_pointer(a).total_cmp(&distance_to_pointer(b)))
+        .map(|found| centre(&found))
 }
 
 unsafe fn current_pointer_location() -> Result<CGPoint, String> {

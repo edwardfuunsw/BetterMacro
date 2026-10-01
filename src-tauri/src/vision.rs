@@ -8,8 +8,9 @@
 
 use std::io::Cursor;
 
-/// Coarse-search candidates that are refined at full resolution.
-const CANDIDATES: usize = 4;
+/// Coarse-search candidates that are refined at full resolution. Enough to
+/// cover a row of identical buttons, so the right one can be chosen by position.
+const CANDIDATES: usize = 8;
 /// The coarse pass shrinks the template until its short side is about this many pixels.
 const COARSE_TEMPLATE_SIDE: usize = 12;
 const MAX_COARSE_FACTOR: usize = 8;
@@ -47,8 +48,50 @@ impl Rect {
 
 pub struct DecodedPng {
     pub image: Gray,
+    pub colour: Colour,
     /// Pixels per point from the PNG's density chunk (2 for Retina screenshots).
     pub scale: Option<f64>,
+}
+
+/// The decoded 8-bit samples, kept so a luminance match can be checked for colour.
+pub struct Colour {
+    width: usize,
+    channels: usize,
+    samples: Vec<u8>,
+}
+
+/// Largest difference in average chromaticity that still counts as the same
+/// colour. Hover highlights move it about 0.04; a green Buy button and a red
+/// Sell button are more than 0.3 apart.
+const MAX_CHROMA_DISTANCE: f32 = 0.1;
+
+impl Colour {
+    /// Red and green shares of the region's average colour. Brightness cancels
+    /// out, so a dimmed or highlighted button keeps the same chromaticity.
+    pub fn chroma(&self, x: usize, y: usize, width: usize, height: usize) -> (f32, f32) {
+        const NEUTRAL: (f32, f32) = (1.0 / 3.0, 1.0 / 3.0);
+        if self.channels < 3 {
+            return NEUTRAL;
+        }
+        let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
+        for row in y..y + height {
+            let start = (row * self.width + x) * self.channels;
+            for px in self.samples[start..start + width * self.channels].chunks_exact(self.channels) {
+                r += u64::from(px[0]);
+                g += u64::from(px[1]);
+                b += u64::from(px[2]);
+            }
+        }
+        let total = (r + g + b) as f32;
+        if total == 0.0 {
+            return NEUTRAL;
+        }
+        (r as f32 / total, g as f32 / total)
+    }
+}
+
+pub fn same_colour(a: (f32, f32), b: (f32, f32)) -> bool {
+    (a.0 - b.0).hypot(a.1 - b.1) <= MAX_CHROMA_DISTANCE
 }
 
 pub fn decode_png(bytes: &[u8]) -> Result<DecodedPng, String> {
@@ -76,7 +119,8 @@ pub fn decode_png(bytes: &[u8]) -> Result<DecodedPng, String> {
         png::ColorType::Rgba => 4,
         png::ColorType::Indexed => return Err("Unsupported indexed PNG".into()),
     };
-    let pixels = buffer[..info.buffer_size()]
+    buffer.truncate(info.buffer_size());
+    let pixels = buffer
         .chunks_exact(channels)
         .map(|px| {
             if channels < 3 {
@@ -93,11 +137,28 @@ pub fn decode_png(bytes: &[u8]) -> Result<DecodedPng, String> {
             height: info.height as usize,
             pixels,
         },
+        colour: Colour {
+            width: info.width as usize,
+            channels,
+            samples: buffer,
+        },
         scale,
     })
 }
 
 impl Gray {
+    pub fn crop(&self, x: usize, y: usize, width: usize, height: usize) -> Gray {
+        let mut pixels = Vec::with_capacity(width * height);
+        for row in y..y + height {
+            pixels.extend_from_slice(&self.pixels[row * self.width + x..][..width]);
+        }
+        Gray {
+            width,
+            height,
+            pixels,
+        }
+    }
+
     /// Averages `factor`×`factor` blocks; trailing partial blocks are dropped.
     pub fn downscaled(&self, factor: usize) -> Gray {
         if factor <= 1 {
@@ -259,19 +320,53 @@ fn score_map(screen: &Gray, template: &Prepared) -> (Vec<f32>, usize) {
     (scores, columns)
 }
 
-/// Returns the best placement of `template` in `screen` whose centre is outside
-/// `excluded`, or `None` when the template cannot be searched at all.
-pub fn find(screen: &Gray, template: &Gray, excluded: &[Rect]) -> Option<Match> {
-    if template.width > screen.width || template.height > screen.height {
-        return None;
+/// Like [`find`], but only searches `area` of `screen`.
+pub fn find_in(screen: &Gray, template: &Gray, excluded: &[Rect], area: Rect) -> Vec<Match> {
+    let x0 = area.x.max(0.0) as usize;
+    let y0 = area.y.max(0.0) as usize;
+    let x1 = ((area.x + area.width).max(0.0) as usize).min(screen.width);
+    let y1 = ((area.y + area.height).max(0.0) as usize).min(screen.height);
+    if x1 <= x0 || y1 <= y0 {
+        return Vec::new();
     }
-    let full = prepare(template)?;
+    let region = screen.crop(x0, y0, x1 - x0, y1 - y0);
+    let shifted: Vec<Rect> = excluded
+        .iter()
+        .map(|rect| Rect {
+            x: rect.x - x0 as f64,
+            y: rect.y - y0 as f64,
+            ..*rect
+        })
+        .collect();
+    find(&region, template, &shifted)
+        .into_iter()
+        .map(|found| Match {
+            x: found.x + x0,
+            y: found.y + y0,
+            ..found
+        })
+        .collect()
+}
+
+/// The strongest few placements of `template` in `screen` whose centres are
+/// outside `excluded`, best first. Empty when the template cannot be searched.
+pub fn find(screen: &Gray, template: &Gray, excluded: &[Rect]) -> Vec<Match> {
+    if template.width > screen.width || template.height > screen.height {
+        return Vec::new();
+    }
+    let Some(full) = prepare(template) else {
+        return Vec::new();
+    };
     let factor = (template.width.min(template.height) / COARSE_TEMPLATE_SIDE)
         .clamp(1, MAX_COARSE_FACTOR);
     // Downscaling can flatten a thin snippet; search those at full resolution.
+    let downscaled_template;
     let (factor, coarse) = match prepare(&template.downscaled(factor)) {
-        Some(coarse) if factor > 1 => (factor, coarse),
-        _ => (1, prepare(template)?),
+        Some(prepared) if factor > 1 => {
+            downscaled_template = prepared;
+            (factor, &downscaled_template)
+        }
+        _ => (1, &full),
     };
     let downscaled;
     let coarse_screen = if factor > 1 {
@@ -280,7 +375,7 @@ pub fn find(screen: &Gray, template: &Gray, excluded: &[Rect]) -> Option<Match> 
     } else {
         screen
     };
-    let (mut scores, columns) = score_map(coarse_screen, &coarse);
+    let (mut scores, columns) = score_map(coarse_screen, coarse);
     let rows = scores.len() / columns;
     let is_excluded = |x: usize, y: usize| {
         let centre_x = (x * factor) as f64 + template.width as f64 / 2.0;
@@ -344,10 +439,9 @@ pub fn find(screen: &Gray, template: &Gray, excluded: &[Rect]) -> Option<Match> 
             .collect();
         handles.into_iter().map(|h| h.join().ok().flatten()).collect()
     });
-    refined
-        .into_iter()
-        .flatten()
-        .max_by(|a, b| a.score.total_cmp(&b.score))
+    let mut matches: Vec<Match> = refined.into_iter().flatten().collect();
+    matches.sort_by(|a, b| b.score.total_cmp(&a.score));
+    matches
 }
 
 #[cfg(test)]
@@ -392,18 +486,6 @@ mod tests {
         }
     }
 
-    fn crop(image: &Gray, x: usize, y: usize, width: usize, height: usize) -> Gray {
-        let mut pixels = Vec::with_capacity(width * height);
-        for row in y..y + height {
-            pixels.extend_from_slice(&image.pixels[row * image.width + x..][..width]);
-        }
-        Gray {
-            width,
-            height,
-            pixels,
-        }
-    }
-
     fn paste(image: &mut Gray, patch: &Gray, x: usize, y: usize) {
         for row in 0..patch.height {
             let start = (y + row) * image.width + x;
@@ -415,8 +497,8 @@ mod tests {
     #[test]
     fn finds_an_exact_snippet_with_a_coarse_pass() {
         let screen = blurred_noise(640, 400, 7);
-        let template = crop(&screen, 311, 187, 90, 40);
-        let found = find(&screen, &template, &[]).unwrap();
+        let template = screen.crop(311, 187, 90, 40);
+        let found = find(&screen, &template, &[])[0];
         assert_eq!((found.x, found.y), (311, 187));
         assert!(found.score > 0.99);
     }
@@ -424,19 +506,19 @@ mod tests {
     #[test]
     fn small_snippets_are_searched_at_full_resolution() {
         let screen = noise(300, 200, 3);
-        let template = crop(&screen, 42, 150, 14, 10);
-        let found = find(&screen, &template, &[]).unwrap();
+        let template = screen.crop(42, 150, 14, 10);
+        let found = find(&screen, &template, &[])[0];
         assert_eq!((found.x, found.y), (42, 150));
     }
 
     #[test]
     fn brightness_and_contrast_changes_still_match() {
         let screen = blurred_noise(400, 300, 11);
-        let mut template = crop(&screen, 120, 80, 60, 36);
+        let mut template = screen.crop(120, 80, 60, 36);
         for pixel in &mut template.pixels {
             *pixel = *pixel * 0.7 + 0.2;
         }
-        let found = find(&screen, &template, &[]).unwrap();
+        let found = find(&screen, &template, &[])[0];
         assert_eq!((found.x, found.y), (120, 80));
         assert!(found.score > 0.99);
     }
@@ -453,7 +535,7 @@ mod tests {
             width: 200.0,
             height: 150.0,
         };
-        let found = find(&screen, &patch, &[own_window]).unwrap();
+        let found = find(&screen, &patch, &[own_window])[0];
         assert_eq!((found.x, found.y), (380, 220));
     }
 
@@ -461,7 +543,7 @@ mod tests {
     fn absent_snippets_score_low() {
         let screen = blurred_noise(400, 300, 21);
         let template = blurred_noise(50, 30, 1234);
-        let found = find(&screen, &template, &[]).unwrap();
+        let found = find(&screen, &template, &[])[0];
         assert!(found.score < 0.8, "unexpected score {}", found.score);
     }
 
@@ -473,7 +555,7 @@ mod tests {
             pixels: vec![0.5; 600],
         };
         assert!(!has_detail(&flat));
-        assert!(find(&blurred_noise(200, 100, 2), &flat, &[]).is_none());
+        assert!(find(&blurred_noise(200, 100, 2), &flat, &[]).is_empty());
     }
 
     #[test]
@@ -501,11 +583,86 @@ mod tests {
     #[test]
     fn resizing_preserves_matchability() {
         let screen = blurred_noise(400, 300, 17);
-        let template = crop(&screen, 200, 100, 80, 40);
+        let template = screen.crop(200, 100, 80, 40);
         let doubled = template.resized(160, 80);
         let restored = doubled.resized(80, 40);
-        let found = find(&screen, &restored, &[]).unwrap();
+        let found = find(&screen, &restored, &[])[0];
         assert_eq!((found.x, found.y), (200, 100));
         assert!(found.score > 0.95);
+    }
+
+    #[test]
+    fn every_copy_of_a_repeated_snippet_is_returned() {
+        let mut screen = blurred_noise(500, 300, 8);
+        let patch = blurred_noise(60, 30, 77);
+        paste(&mut screen, &patch, 40, 40);
+        paste(&mut screen, &patch, 380, 220);
+        let mut places: Vec<_> = find(&screen, &patch, &[])
+            .into_iter()
+            .filter(|found| found.score > 0.99)
+            .map(|found| (found.x, found.y))
+            .collect();
+        places.sort();
+        assert_eq!(places, [(40, 40), (380, 220)]);
+    }
+
+    #[test]
+    fn an_area_search_finds_the_copy_inside_it() {
+        let mut screen = blurred_noise(500, 300, 8);
+        let patch = blurred_noise(60, 30, 77);
+        paste(&mut screen, &patch, 40, 40);
+        paste(&mut screen, &patch, 380, 220);
+        let around_second = Rect {
+            x: 300.0,
+            y: 180.0,
+            width: 200.0,
+            height: 120.0,
+        };
+        let found = find_in(&screen, &patch, &[], around_second)[0];
+        assert_eq!((found.x, found.y), (380, 220));
+        assert!(find_in(&screen, &patch, &[], Rect { x: 600.0, ..around_second }).is_empty());
+    }
+
+    #[test]
+    fn colour_tells_buy_from_sell_but_tolerates_highlights() {
+        // Three 4×4 swatches side by side: green, red, lighter green, each with
+        // a quarter of white "text".
+        let swatch = |base: [u8; 3]| -> Vec<[u8; 3]> {
+            (0..16).map(|i| if i % 4 == 0 { [255, 255, 255] } else { base }).collect()
+        };
+        let swatches = [swatch([8, 153, 129]), swatch([242, 54, 69]), swatch([40, 175, 150])];
+        let mut samples = Vec::new();
+        for row in 0..4 {
+            for swatch in &swatches {
+                for px in &swatch[row * 4..row * 4 + 4] {
+                    samples.extend_from_slice(px);
+                }
+            }
+        }
+        let colour = Colour {
+            width: 12,
+            channels: 3,
+            samples,
+        };
+        let buy = colour.chroma(0, 0, 4, 4);
+        let sell = colour.chroma(4, 0, 4, 4);
+        let highlighted_buy = colour.chroma(8, 0, 4, 4);
+        assert!(!same_colour(buy, sell));
+        assert!(same_colour(buy, highlighted_buy));
+    }
+
+    #[test]
+    fn decoding_keeps_colour_for_the_check() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 2, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        }
+        let decoded = decode_png(&bytes).unwrap();
+        assert_eq!(decoded.colour.chroma(0, 0, 1, 1), (1.0, 0.0));
+        assert_eq!(decoded.colour.chroma(1, 0, 1, 1), (0.0, 0.0));
     }
 }

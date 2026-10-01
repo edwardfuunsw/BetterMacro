@@ -10,7 +10,7 @@ use std::sync::{
 };
 
 use macos::{MacAutomation, PermissionState};
-use model::{Action, ImageCapture, MacroDocument, PlaybackProgress, RecordingSettings};
+use model::{Action, ImageCapture, MacroDocument, PlaybackProgress, RecordingSettings, ScreenPoint};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -216,6 +216,29 @@ async fn capture_image(app: AppHandle) -> Result<Option<ImageCapture>, String> {
     result
 }
 
+#[tauri::command]
+async fn pick_point(app: AppHandle) -> Result<ScreenPoint, String> {
+    // Hidden so the user can see and hover over the spot behind the window.
+    let window = app.get_webview_window("main");
+    if let Some(window) = &window {
+        let _ = window.hide();
+    }
+    let result = match tauri::async_runtime::spawn_blocking(|| {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        macos::pointer_location()
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("Unable to read the pointer position: {error}")),
+    };
+    if let Some(window) = &window {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    result
+}
+
 pub fn run() {
     let automation = Arc::new(MacAutomation::new());
 
@@ -263,7 +286,8 @@ pub fn run() {
             delete_macro,
             export_macro,
             import_macro,
-            capture_image
+            capture_image,
+            pick_point
         ])
         .run(tauri::generate_context!())
         .expect("error while running BetterMacro");
